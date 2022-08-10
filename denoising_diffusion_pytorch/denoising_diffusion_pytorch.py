@@ -659,9 +659,9 @@ class Dataset(Dataset):
         maybe_convert_fn = partial(convert_image_to, convert_image_to) if exists(convert_image_to) else nn.Identity()
 
         self.transform = T.Compose([
-            T.Lambda(maybe_convert_fn),
+            # T.Lambda(maybe_convert_fn),
             T.Resize(image_size),
-            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+            # T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
             T.CenterCrop(image_size),
             T.ToTensor()
         ])
@@ -722,7 +722,9 @@ class Trainer(object):
         # dataset and dataloader
 
         self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        # dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = False, num_workers = int(cpu_count()/2))
+        
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
@@ -824,5 +826,8 @@ class Trainer(object):
 
                 self.step += 1
                 pbar.update(1)
+                
+                self.scheduler.step(total_loss)
+                
 
         accelerator.print('training complete')
