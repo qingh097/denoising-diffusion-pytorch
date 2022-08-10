@@ -1,5 +1,6 @@
 import math
 import copy
+from turtle import forward
 import torch
 from torch import nn, einsum
 import torch.nn.functional as F
@@ -22,6 +23,9 @@ from tqdm.auto import tqdm
 from ema_pytorch import EMA
 
 from accelerate import Accelerator
+from torch.optim.lr_scheduler import ExponentialLR
+
+import wandb
 
 # constants
 
@@ -724,8 +728,8 @@ class Trainer(object):
         self.dl = cycle(dl)
 
         # optimizer
-
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
+        self.scheduler = ExponentialLR(self.opt, gamma=0.99)
 
         # for logging results in a folder periodically
 
@@ -792,6 +796,8 @@ class Trainer(object):
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
 
+                wandb.log({"Loss/Train Loss": total_loss, 'lr': self.opt.state_dict()['param_groups'][0]['lr']})
+
                 accelerator.wait_for_everyone()
 
                 self.opt.step()
@@ -812,6 +818,7 @@ class Trainer(object):
                             all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim = 0)
+                        wandb.log({'Image': wandb.Image(all_images)})
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
                         self.save(milestone)
 
