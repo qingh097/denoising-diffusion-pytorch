@@ -667,19 +667,19 @@ class Dataset(Dataset):
             T.ToTensor()
         ])
         
-        self.img_list = []
-        for p in self.paths:
-            self.img_list.append(self.transform(Image.open(p)))
+        # self.img_list = []
+        # for p in self.paths:
+        #     self.img_list.append(self.transform(Image.open(p)))
             
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
-        return self.img_list[index]
-        # path = self.paths[index]
-        # img = Image.open(path)
-        # return self.transform(img)
+        # return self.img_list[index]
+        path = self.paths[index]
+        img = Image.open(path)
+        return self.transform(img)
 
 # trainer class
 
@@ -728,8 +728,8 @@ class Trainer(object):
         # dataset and dataloader
 
         self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 2)
-        # dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = False, num_workers = int(cpu_count()/2))
+        # dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 2)
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = int(cpu_count()/2))
         
 
         dl = self.accelerator.prepare(dl)
@@ -767,7 +767,9 @@ class Trainer(object):
             'scaler': self.accelerator.scaler.state_dict() if exists(self.accelerator.scaler) else None
         }
 
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        # torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.results_folder / f'model.pt'))
+        
 
     def load(self, milestone):
         data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
