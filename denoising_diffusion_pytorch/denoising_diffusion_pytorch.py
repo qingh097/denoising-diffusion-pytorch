@@ -26,6 +26,7 @@ from accelerate import Accelerator
 from torch.optim.lr_scheduler import ExponentialLR
 
 import wandb
+import cProfile, pstats
 
 # constants
 
@@ -665,14 +666,20 @@ class Dataset(Dataset):
             T.CenterCrop(image_size),
             T.ToTensor()
         ])
+        
+        self.img_list = []
+        for p in self.paths:
+            self.img_list.append(self.transform(Image.open(p)))
+            
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
-        path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        return self.img_list[index]
+        # path = self.paths[index]
+        # img = Image.open(path)
+        # return self.transform(img)
 
 # trainer class
 
@@ -699,10 +706,9 @@ class Trainer(object):
         convert_image_to = None
     ):
         super().__init__()
-
         self.accelerator = Accelerator(
             split_batches = split_batches,
-            mixed_precision = 'fp16' if fp16 else 'no'
+            mixed_precision = 'fp16' if fp16 else 'no',
         )
 
         self.accelerator.native_amp = amp
@@ -722,8 +728,8 @@ class Trainer(object):
         # dataset and dataloader
 
         self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
-        # dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = False, num_workers = int(cpu_count()/2))
+        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 2)
+        # dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = False, num_workers = int(cpu_count()/2))
         
 
         dl = self.accelerator.prepare(dl)
@@ -779,6 +785,9 @@ class Trainer(object):
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
+        
+        # profiler = cProfile.Profile()
+        # profiler.enable()
 
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
 
@@ -829,5 +838,14 @@ class Trainer(object):
                 
                 self.scheduler.step(total_loss)
                 
+                
+            # profiler.dump_stats('output.prof')
+
+            # stream = open('./export-data-eval.txt', 'w')
+            # stats = pstats.Stats('output.prof', stream=stream)
+            # stats.sort_stats('cumtime')
+            # stats.print_stats()
+                    
+            # profiler.disable()
 
         accelerator.print('training complete')
