@@ -1,0 +1,4 @@
+context: True
+rgb: True
+encoder_dir: /home/jkerr/tac_vision/output/contrastive51
+encoder_ckpt: /home/jkerr/tac_vision/output/contrastive51/models/epoch=419-step=7560.ckpt

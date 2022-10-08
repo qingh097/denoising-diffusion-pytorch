@@ -1,5 +1,6 @@
 import math
 import copy
+from tkinter.messagebox import NO
 from turtle import forward
 import torch
 from torch import nn, einsum
@@ -27,6 +28,8 @@ from torch.optim.lr_scheduler import ExponentialLR
 
 import wandb
 import cProfile, pstats
+from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
+
 
 # constants
 
@@ -259,7 +262,8 @@ class Unet(nn.Module):
         resnet_block_groups = 8,
         learned_variance = False,
         learned_sinusoidal_cond = False,
-        learned_sinusoidal_dim = 16
+        learned_sinusoidal_dim = 16,
+        latent_dim = 32,
     ):
         super().__init__()
 
@@ -291,6 +295,12 @@ class Unet(nn.Module):
         self.time_mlp = nn.Sequential(
             sinu_pos_emb,
             nn.Linear(fourier_dim, time_dim),
+            nn.GELU(),
+            nn.Linear(time_dim, time_dim)
+        )
+        
+        self.latent_mlp = nn.Sequential(
+            nn.Linear(latent_dim, time_dim),
             nn.GELU(),
             nn.Linear(time_dim, time_dim)
         )
@@ -332,11 +342,15 @@ class Unet(nn.Module):
         self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
-    def forward(self, x, time):
+    def forward(self, x, time, latent=None):
         x = self.init_conv(x)
         r = x.clone()
 
         t = self.time_mlp(time)
+        
+        if latent is not None and len(latent.shape)>1:
+            latent = self.latent_mlp(latent)
+            t = t + latent
 
         h = []
 
@@ -408,11 +422,10 @@ class GaussianDiffusion(nn.Module):
         beta_schedule = 'cosine',
         p2_loss_weight_gamma = 0., # p2 loss weight, from https://arxiv.org/abs/2204.00227 - 0 is equivalent to weight of 1 across time - 1. is recommended
         p2_loss_weight_k = 1,
-        ddim_sampling_eta = 1.
+        ddim_sampling_eta = 1.,
     ):
         super().__init__()
         assert not (type(self) == GaussianDiffusion and model.channels != model.out_dim)
-
         self.channels = channels
         self.image_size = image_size
         self.model = model
@@ -510,7 +523,20 @@ class GaussianDiffusion(nn.Module):
             x_start = model_output
 
         return ModelPrediction(pred_noise, x_start)
+    
+    def model_predictions_context(self, x, t, latent):
+        model_output = self.model(x, t, latent)
 
+        if self.objective == 'pred_noise':
+            pred_noise = model_output
+            x_start = self.predict_start_from_noise(x, t, model_output)
+
+        elif self.objective == 'pred_x0':
+            pred_noise = self.predict_noise_from_start(x, t, model_output)
+            x_start = model_output
+
+        return ModelPrediction(pred_noise, x_start)
+    
     def p_mean_variance(self, x, t, clip_denoised: bool):
         preds = self.model_predictions(x, t)
         x_start = preds.pred_x_start
@@ -573,12 +599,53 @@ class GaussianDiffusion(nn.Module):
 
         img = unnormalize_to_zero_to_one(img)
         return img
+    
+    @torch.no_grad()
+    def ddim_sample_context(self, latent, shape, clip_denoised = True):
+        batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
+
+        times = torch.linspace(0., total_timesteps, steps = sampling_timesteps + 2)[:-1]
+        times = list(reversed(times.int().tolist()))
+        time_pairs = list(zip(times[:-1], times[1:]))
+
+        img = torch.randn(shape, device = device)
+
+        for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
+            alpha = self.alphas_cumprod_prev[time]
+            alpha_next = self.alphas_cumprod_prev[time_next]
+
+            time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
+
+            pred_noise, x_start, *_ = self.model_predictions_context(img, time_cond,latent)
+
+            if clip_denoised:
+                x_start.clamp_(-1., 1.)
+
+            sigma = eta * ((1 - alpha / alpha_next) * (1 - alpha_next) / (1 - alpha)).sqrt()
+            c = ((1 - alpha_next) - sigma ** 2).sqrt()
+
+            noise = torch.randn_like(img) if time_next > 0 else 0.
+
+            img = x_start * alpha_next.sqrt() + \
+                  c * pred_noise + \
+                  sigma * noise
+
+        img = unnormalize_to_zero_to_one(img)
+        return img
 
     @torch.no_grad()
     def sample(self, batch_size = 16):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, image_size, image_size))
+    
+    @torch.no_grad()
+    def guide_sample(self, xgt, latent):
+        batch_size = xgt.shape[0]
+        image_size, channels = self.image_size, self.channels
+        assert self.is_ddim_sampling, "only applied to ddim"
+        sample_fn = self.ddim_sample_context
+        return sample_fn(latent,( batch_size, channels, image_size, image_size))
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -613,12 +680,12 @@ class GaussianDiffusion(nn.Module):
         else:
             raise ValueError(f'invalid loss type {self.loss_type}')
 
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, latent, noise = None):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
-        model_out = self.model(x, t)
+        model_out = self.model(x, t, latent)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -633,13 +700,16 @@ class GaussianDiffusion(nn.Module):
         loss = loss * extract(self.p2_loss_weight, t, loss.shape)
         return loss.mean()
 
+
     def forward(self, img, *args, **kwargs):
-        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        image = img["img"]
+        latent = img['latent']
+        b, c, h, w, device, img_size, = *image.shape, image.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
-        img = normalize_to_neg_one_to_one(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        image = normalize_to_neg_one_to_one(image)
+        return self.p_losses(image, t, latent, *args, **kwargs)
 
 # dataset classes
 
@@ -650,7 +720,8 @@ class Dataset(Dataset):
         image_size,
         exts = ['jpg', 'jpeg', 'png', 'tiff'],
         augment_horizontal_flip = False,
-        convert_image_to = None
+        convert_image_to = None,
+        context_image_size =  None
     ):
         super().__init__()
         self.folder = folder
@@ -658,7 +729,6 @@ class Dataset(Dataset):
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
 
         maybe_convert_fn = partial(convert_image_to, convert_image_to) if exists(convert_image_to) else nn.Identity()
-
         self.transform = T.Compose([
             # T.Lambda(maybe_convert_fn),
             T.Resize(image_size),
@@ -666,7 +736,15 @@ class Dataset(Dataset):
             T.CenterCrop(image_size),
             T.ToTensor()
         ])
-        
+        context_img_size = image_size if context_image_size is None else context_image_size
+        self.context_transform = T.Compose([
+            # T.Lambda(maybe_convert_fn),
+            T.Resize(context_img_size),
+            # T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+            T.CenterCrop(context_img_size),
+            T.ToTensor()
+        ])
+
         # self.img_list = []
         # for p in self.paths:
         #     self.img_list.append(self.transform(Image.open(p)))
@@ -678,8 +756,10 @@ class Dataset(Dataset):
     def __getitem__(self, index):
         # return self.img_list[index]
         path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        img =  Image.open(path)
+        img_input = self.transform(img)
+
+        return {'img':img_input,'raw':self.context_transform(img)}
 
 # trainer class
 
@@ -703,17 +783,23 @@ class Trainer(object):
         amp = False,
         fp16 = False,
         split_batches = True,
-        convert_image_to = None
+        convert_image_to = None,
+        context_img_size = [192,192],
+        context_encoder = None
     ):
         super().__init__()
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = 'fp16' if fp16 else 'no',
         )
-
+        
         self.accelerator.native_amp = amp
 
         self.model = diffusion_model
+        self.context_encoder = context_encoder
+        for param in self.context_encoder.parameters():
+            param.requires_grad = False
+
 
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
@@ -728,16 +814,23 @@ class Trainer(object):
         # dataset and dataloader
 
         self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        train_len = int(0.8 * len(self.ds))
+        val_len = int(len(self.ds) - train_len)
+        train_data, val_data = torch.utils.data.random_split(self.ds, [train_len, val_len])
         # dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = 2)
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = int(cpu_count()/2))
-        
+        dl = DataLoader(train_data, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = int(cpu_count()/2))
+        val_dl = DataLoader(val_data, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = int(cpu_count()/2))
 
         dl = self.accelerator.prepare(dl)
         self.dl = cycle(dl)
+        
+        val_dl = self.accelerator.prepare(val_dl)
+        self.val_dl = cycle(val_dl)
 
         # optimizer
-        self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
-        self.scheduler = ExponentialLR(self.opt, gamma=0.99)
+        self.opt = Adam(filter(lambda p: p.requires_grad, diffusion_model.parameters()), lr = train_lr, betas = adam_betas)
+        # self.scheduler = ExponentialLR(self.opt, gamma=0.99)
+        self.scheduler = LinearWarmupCosineAnnealingLR(self.opt, warmup_epochs=1000,eta_min=1e-6,max_epochs=100000)
 
         # for logging results in a folder periodically
 
@@ -772,7 +865,8 @@ class Trainer(object):
         
 
     def load(self, milestone):
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+        # data = torch.load(str(self.results_folder / f'model-{milestone}.pt'))
+        data = torch.load(str(self.results_folder / f'model.pt'))
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
@@ -798,7 +892,11 @@ class Trainer(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    data = next(self.dl)
+                    for k,v in data.items():
+                        data[k] = v.to(device)
+                    # import pdb;pdb.set_trace()
+                    data['latent'] = self.context_encoder(data['raw'])
 
                     with self.accelerator.autocast():
                         loss = self.model(data)
@@ -813,6 +911,7 @@ class Trainer(object):
 
                 accelerator.wait_for_everyone()
 
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
                 self.opt.step()
                 self.opt.zero_grad()
 
@@ -828,17 +927,31 @@ class Trainer(object):
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                            if self.context_encoder is not None:
+                                self.num_samples = 2*self.batch_size
+                                batches = num_to_groups(self.num_samples, self.batch_size)
+                                val_data = next(self.val_dl)
+                                for k,v in val_data.items():
+                                    val_data[k] = v.to(device)
+                                val_data['latent'] = self.context_encoder(val_data['raw'])          
+                                xgt = val_data['img']
+                                latent = val_data['latent']
+                                # import pdb;pdb.set_trace()
+                                all_images_list = list(map(lambda n: self.ema.ema_model.guide_sample(xgt,latent), batches))
+                                wandb.log({'GtImage': wandb.Image(xgt)})
+                                utils.save_image(xgt, str(self.results_folder / f'sample-gt-{milestone}.jpg'), nrow = int(math.sqrt(self.num_samples)))
+                            else:
+                                all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
 
                         all_images = torch.cat(all_images_list, dim = 0)
                         wandb.log({'Image': wandb.Image(all_images)})
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.jpg'), nrow = int(math.sqrt(self.num_samples)))
                         self.save(milestone)
 
                 self.step += 1
                 pbar.update(1)
                 
-                self.scheduler.step(total_loss)
+                self.scheduler.step()
                 
                 
             # profiler.dump_stats('output.prof')
